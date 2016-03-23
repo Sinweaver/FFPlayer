@@ -4,7 +4,7 @@ FFPlayer is a multimedia playback library based on Qt and FFmpeg.
 
 ## Usage
 
-1. Build FFMpeg with using [scripts directory](https://github.com/Sinweaver/FFPlayer/tree/master/scripts) ([Zeranoe](https://ffmpeg.zeranoe.com/builds/) for Windows).
+1. Build FFMpeg with using [scripts](https://github.com/Sinweaver/FFPlayer/tree/master/scripts) ([Zeranoe](https://ffmpeg.zeranoe.com/builds/) for Windows).
 2. [Download repository](https://github.com/Sinweaver/FFPlayer/archive/master.zip)
 3. Drop files from [FFPlayer directory](https://github.com/Sinweaver/FFPlayer/tree/master/FFPlayer) in your project.
 4. In the source files where you need to use the library, import the header file:
