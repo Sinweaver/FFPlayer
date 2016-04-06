@@ -26,30 +26,96 @@
 //
 
 #include "ffplayer.h"
-#include "ffplayer_p.h"
 
 #include <QDebug>
-#include <QMutexLocker>
-#include <limits>
+#include <QtConcurrent>
+#include <QSharedPointer>
+
+#include "ffheaders.h"
+#include "ffdecoder.h"
+
+#define DEFAULT_INTERRUPT_TIMEOUT   300000       // 300 sec.
+#define READ_INTERRUPT_TIMEOUT      10000        // 10 sec.
+
+#define THREAD_SLEEP_TIMEOUT        1000         // 1 sec.
+
+class FFPlayerPrivate  : public QObject {
+    Q_DECLARE_PUBLIC(FFPlayer)
+public:
+    explicit FFPlayerPrivate();
+
+    void open(const QUrl &url);
+    AVFormatContext *openContext(const QUrl &url);
+    void closeContext(AVFormatContext *formatContext);
+    void decodeFrames(AVFormatContext *formatContext);
+
+    bool isUserNeedAutoReconnect() const;
+    void setIsUserNeedAutoReconnect(bool isUserNeedAutoReconnect);
+
+    bool isReadyToReconnect() const;
+    void setIsReadyToReconnect(bool isReadyToReconnect);
+
+    void resetInterruptTimer(int timeoutInMsecs);
+
+    bool isInterruptedByTimeout() const;
+    void setIsInterruptedByTimeout(bool isInterruptedByTimeout);
+
+    bool isInterruptedByUser() const;
+    void setIsInterruptedByUser(bool isInterruptedByUser);
+
+    qint64 interruptTimeMsec() const;
+    void setInterruptTimeMsec(qint64 msecs);
+
+    FFPlayer::State state() const;
+    void setState(const FFPlayer::State &state);
+
+public:
+    FFPlayer             *q_ptr;
+    QFutureWatcher<void> future_watcher;
+
+private:
+    FFPlayer::State      _state;
+
+    bool                 _isReadyToReconnect;
+    bool                 _isUserNeedAutoReconnect;
+
+    bool                 _isInterruptedByTimeout;
+    bool                 _isInterruptedByUser;
+    qint64               _interruptTimeMsec; // in MSecs
+
+    mutable QMutex       _stateMutex;
+    mutable QMutex       _interruptMutex;
+    mutable QMutex       _reconnectMutex;
+};
+
+static int decode_interrupt_cb(void *opaque) {
+    FFPlayerPrivate *is = static_cast<FFPlayerPrivate *>(opaque);
+    if (QDateTime::currentDateTime().toMSecsSinceEpoch() >= is->interruptTimeMsec()) {
+        is->setIsInterruptedByTimeout(true);
+    }
+
+    return static_cast<int>(is->isInterruptedByTimeout() || is->isInterruptedByUser());
+}
 
 /*
  * FFPlayerPrivate
  */
 FFPlayerPrivate::FFPlayerPrivate() :
     q_ptr(0),
-    _formatContext(0),
-    _decoder(),
-    _state(FFPlayer::FFPlayerStateClosed),
-    _isNeedAbort(false),
-    _contextLocker(QMutex::NonRecursive),
-    _stateLocker(QMutex::NonRecursive),
-    _abortLocker(QMutex::NonRecursive) {
+    future_watcher(),
+    _state(FFPlayer::StoppedState),
+    _isReadyToReconnect(false),
+    _isUserNeedAutoReconnect(false),
+    _isInterruptedByTimeout(false),
+    _isInterruptedByUser(false),
+    _interruptTimeMsec(0),
+    _stateMutex(QMutex::NonRecursive),
+    _interruptMutex(QMutex::NonRecursive),
+    _reconnectMutex(QMutex::NonRecursive) {
 
     class AVInitializer {
     public:
         AVInitializer() {
-            qRegisterMetaType<FFVideoFramePtr>("FFVideoFramePtr");
-
             // Initialize library ffmpeg using av_register_all ().
             // During initialization, recorded all available in the library
             // File formats and codecs.
@@ -74,14 +140,38 @@ FFPlayerPrivate::FFPlayerPrivate() :
 #endif
 }
 
-FFPlayerPrivate::~FFPlayerPrivate() {
-    close();
-}
-
-bool FFPlayerPrivate::_openContent(const QUrl &url) {
+void FFPlayerPrivate::open(const QUrl &url) {
     Q_Q(FFPlayer);
 
-    setIsNeedAbort(false);
+    // Reset interrupt state.
+    setIsInterruptedByUser(false);
+    setIsInterruptedByTimeout(false);
+
+    AVFormatContext *formatContext = openContext(url);
+    if (!formatContext) {
+        return;
+    }
+
+    setState(FFPlayer::PausedState);
+    emit(q->contentDidOpened());
+
+    // Start decoding frames.
+    decodeFrames(formatContext);
+
+    // Close and free context.
+    closeContext(formatContext);
+
+    setState(FFPlayer::StoppedState);
+    emit(q->contentDidClosed());
+}
+
+AVFormatContext *FFPlayerPrivate::openContext(const QUrl &url) {
+    // Allocate memory for AVFormatContext.
+    AVFormatContext *formatContext = avformat_alloc_context();
+    formatContext->interrupt_callback.callback = decode_interrupt_cb;
+    formatContext->interrupt_callback.opaque = this;
+
+    QString filePath = url.toString();
 
     // Set the options if its streaming video
     AVDictionary *rtmp_options = 0;
@@ -91,173 +181,148 @@ bool FFPlayerPrivate::_openContent(const QUrl &url) {
         av_dict_set(&rtmp_options, "rtsp_transport", "tcp", 0);
     }
 
-    // выделяем память под AVFormatContext.
-    AVFormatContext *formatContext = avformat_alloc_context();
-
-    // открываем Movie.
-    QString filePath = url.toString();
+    // Open an input stream.
+    // Set interrupt timeout.
+    resetInterruptTimer(DEFAULT_INTERRUPT_TIMEOUT);
     if (avformat_open_input(&formatContext, filePath.toStdString().c_str(),
                             0, &rtmp_options) < 0) {
+        avformat_free_context(formatContext);
         av_dict_free(&rtmp_options);
-        return false;
+        return 0;
+    }
+
+    // Retrieve stream information
+    // Set interrupt timeout.
+    resetInterruptTimer(DEFAULT_INTERRUPT_TIMEOUT);
+    if (avformat_find_stream_info(formatContext, NULL) < 0) {
+        avformat_close_input(&formatContext);
+        avformat_free_context(formatContext);
+        av_dict_free(&rtmp_options);
+        return 0;
     }
 
     av_dict_free(&rtmp_options);
 
-    // retrieve stream information
-    if (avformat_find_stream_info(formatContext, NULL) < 0) {
-        avformat_close_input(&formatContext);
-        return false;
-    }
-
-    QMutexLocker l(&_contextLocker);
-    _formatContext = formatContext;
-    _decoder = FFDecoderPtr(new FFDecoder(_formatContext));
-
-    emit(q->contentDidOpened());
-
-    return true;
+    return formatContext;
 }
 
-void FFPlayerPrivate::_closeContent() {
+void FFPlayerPrivate::closeContext(AVFormatContext *formatContext) {
+    // Set interrupt timeout.
+    resetInterruptTimer(DEFAULT_INTERRUPT_TIMEOUT);
+    avformat_close_input(&formatContext);
+
+    avformat_free_context(formatContext);
+}
+
+void FFPlayerPrivate::decodeFrames(AVFormatContext *formatContext) {
     Q_Q(FFPlayer);
 
-    QMutexLocker l(&_contextLocker);
-    _decoder.clear();
+    FFDecoder decoder(formatContext);
 
-    if (_formatContext) {
-        avformat_close_input(&_formatContext);
-        _formatContext = 0;
-    }
-    l.unlock();
+    while (!isInterruptedByTimeout() && !isInterruptedByUser()) {
+        if (state() == FFPlayer::PlayingState) {
+            // initialize packet, set data to NULL, let the demuxer fill it
+            AVPacket packet;
+            av_init_packet(&packet);
+            packet.data = NULL;
+            packet.size = 0;
 
-    setState(FFPlayer::FFPlayerStateClosed);
-    emit(q->contentDidClosed());
-}
+            // read frames from the file
+            // Set interrupt timeout.
+            resetInterruptTimer(READ_INTERRUPT_TIMEOUT);
+            int ret = av_read_frame(formatContext, &packet);
 
-void FFPlayerPrivate::open(const QUrl &url) {
-    if (_future_watcher.isRunning()) {
-        return;
-    }
+            // End of stream.
+            if (ret < 0) {
+                setIsReadyToReconnect(false);
+                av_packet_unref(&packet);
+                return;
+            }
 
-    _future_watcher.setFuture(QtConcurrent::run([this,url](){
-        Q_Q(FFPlayer);
-
-        if (!_openContent(url)) {
-            return;
-        }
-
-        setState(FFPlayer::FFPlayerStatePaused);
-
-        // initialize packet, set data to NULL, let the demuxer fill it
-        AVPacket packet;
-        av_init_packet(&packet);
-        packet.data = NULL;
-        packet.size = 0;
-
-        while (!isNeedAbort()) {
-            if (getState() == FFPlayer::FFPlayerStatePlaying) {
-                QMutexLocker l(&_contextLocker);
-                // read frames from the file
-                bool isEOF = av_read_frame(_formatContext, &packet) < 0;
-                if (isEOF) {
-                    break;
+            // Connection lost.
+            if (isInterruptedByTimeout()) {
+                if (isUserNeedAutoReconnect()) {
+                    setIsReadyToReconnect(true);
                 }
 
-                QList<QSharedPointer<FFFrame>> frames = _decoder->decodeFrames(&packet);
-                int timeout = 0;
-                for (int i = 0; i < frames.count(); i++) {
-                    if (frames[i]->getFrameType() == FFFrame::FFFrameTypeVideo) {
-                        QSharedPointer<FFVideoFrame> frame = qSharedPointerCast<FFVideoFrame>(frames[i]);
-                        float interval = frame->frameDelayMsec;
-                        timeout = (int)qMax(interval, 0.0f);
-                        emit(q->updateVideoFrame(frame));
-                    }
+                av_packet_unref(&packet);
+                return;
+            }
+
+            QList<FFFramePtr> frames = decoder.decodeFrames(&packet);
+            for (int i = 0; i < frames.count(); i++) {
+                if (frames[i]->getFrameType() == FFFrame::FFFrameTypeVideo) {
+                    QSharedPointer<FFVideoFrame> frame = qSharedPointerCast<FFVideoFrame>(frames[i]);
+
+                    emit(q->updateVideoFrame(frame));
                 }
             }
+
+            av_packet_unref(&packet);
         }
-
-        av_packet_unref(&packet);
-
-        _closeContent();
-    }));
-}
-
-void FFPlayerPrivate::close() {
-    setIsNeedAbort(true);
-
-    if (_future_watcher.isRunning()) {
-        _future_watcher.cancel();
-        _future_watcher.waitForFinished();
+        else {
+            QThread::msleep(100);
+        }
     }
 }
 
-void FFPlayerPrivate::play() {
-    if (getState() != FFPlayer::FFPlayerStatePlaying) {
-        setState(FFPlayer::FFPlayerStatePlaying);
-    }
+void FFPlayerPrivate::resetInterruptTimer(int timeoutInMsecs) {
+    QDateTime endDateTime = QDateTime::currentDateTime().addMSecs(timeoutInMsecs);
+    setInterruptTimeMsec(endDateTime.toMSecsSinceEpoch());
 }
 
-void FFPlayerPrivate::pause() {
-    if (getState() == FFPlayer::FFPlayerStatePlaying) {
-        setState(FFPlayer::FFPlayerStatePaused);
-    }
-}
-
-bool FFPlayerPrivate::isNeedAbort() const {
-    QMutexLocker l(&_abortLocker);
-    return _isNeedAbort;
-}
-
-void FFPlayerPrivate::setIsNeedAbort(bool isNeedAbort) {
-    QMutexLocker l(&_abortLocker);
-    _isNeedAbort = isNeedAbort;
-}
-
-void FFPlayerPrivate::setState(const FFPlayer::FFPlayerState &state) {
-    Q_Q(FFPlayer);
-
-    QMutexLocker l(&_stateLocker);
-    _state = state;
-    emit(q->stateChanged(_state));
-}
-
-FFPlayer::FFPlayerState FFPlayerPrivate::getState() const {
-    QMutexLocker l(&_stateLocker);
+FFPlayer::State FFPlayerPrivate::state() const {
+    QMutexLocker stateLock(&_stateMutex);
     return _state;
 }
 
-bool FFPlayerPrivate::validVideo() const {
-    QMutexLocker l(&_contextLocker);
-    return !_decoder.isNull();
+void FFPlayerPrivate::setState(const FFPlayer::State &state) {
+    QMutexLocker stateLock(&_stateMutex);
+    _state = state;
 }
 
-bool FFPlayerPrivate::validAudio() const {
-    QMutexLocker l(&_contextLocker);
-    return !_decoder.isNull();
+bool FFPlayerPrivate::isUserNeedAutoReconnect() const {
+    QMutexLocker stateLock(&_reconnectMutex);
+    return _isUserNeedAutoReconnect;
 }
 
-int FFPlayerPrivate::getFrameWidth() const {
-    QMutexLocker l(&_contextLocker);
-    return !_decoder.isNull() ? _decoder->getFrameWidth() : 0;
+void FFPlayerPrivate::setIsUserNeedAutoReconnect(bool isUserNeedAutoReconnect) {
+    QMutexLocker stateLock(&_reconnectMutex);
+    _isUserNeedAutoReconnect = isUserNeedAutoReconnect;
 }
 
-int FFPlayerPrivate::getFrameHeight() const {
-    QMutexLocker l(&_contextLocker);
-    return !_decoder.isNull() ? _decoder->getFrameHeight() : 0;
+bool FFPlayerPrivate::isReadyToReconnect() const {
+    return _isReadyToReconnect;
 }
 
-double FFPlayerPrivate::getDuration() const {
-    QMutexLocker l(&_contextLocker);
-    if (!_formatContext) {
-        return 0;
-    }
+void FFPlayerPrivate::setIsReadyToReconnect(bool isReadyToReconnect) {
+    _isReadyToReconnect = isReadyToReconnect;
+}
 
-    if (_formatContext->duration == AV_NOPTS_VALUE) {
-        return std::numeric_limits<float>::max();
-    }
+bool FFPlayerPrivate::isInterruptedByUser() const {
+    QMutexLocker abortLock(&_interruptMutex);
+    return _isInterruptedByUser;
+}
 
-    return (double)_formatContext->duration / (double)AV_TIME_BASE;
+void FFPlayerPrivate::setIsInterruptedByUser(bool isInterruptedByUser) {
+    QMutexLocker abortLock(&_interruptMutex);
+    _isInterruptedByUser = isInterruptedByUser;
+}
+
+bool FFPlayerPrivate::isInterruptedByTimeout() const {
+    return _isInterruptedByTimeout;
+}
+
+void FFPlayerPrivate::setIsInterruptedByTimeout(bool isInterruptedByTimeout) {
+    _isInterruptedByTimeout = isInterruptedByTimeout;
+}
+
+qint64 FFPlayerPrivate::interruptTimeMsec() const {
+    return _interruptTimeMsec;
+}
+
+void FFPlayerPrivate::setInterruptTimeMsec(qint64 msecs) {
+    _interruptTimeMsec = msecs;
 }
 
 /*
@@ -269,52 +334,73 @@ FFPlayer::FFPlayer(QObject *parent) :
 
     Q_D(FFPlayer);
     d->q_ptr = this;
+
+    qRegisterMetaType<FFVideoFramePtr>("FFVideoFramePtr");
 }
 
 FFPlayer::~FFPlayer() {
-
+    close();
 }
 
 void FFPlayer::open(const QUrl &url) {
     Q_D(FFPlayer);
-    d->open(url);
+
+    if (d->future_watcher.isRunning()) {
+#ifdef QT_DEBUG
+        qWarning()<<"Is already opened!!!";
+#endif
+        return;
+    }
+
+    d->future_watcher.setFuture(QtConcurrent::run([this,url](){
+        Q_D(FFPlayer);
+
+        forever {
+            d->open(url);
+
+            if (d->isInterruptedByUser() || !d->isReadyToReconnect()) {
+                break;
+            }
+            else {
+                QThread::msleep(THREAD_SLEEP_TIMEOUT);
+            }
+        }
+    }));
 }
 
 void FFPlayer::play() {
     Q_D(FFPlayer);
-    d->play();
+
+    d->setState(FFPlayer::PlayingState);
 }
 
 void FFPlayer::pause() {
     Q_D(FFPlayer);
-    d->pause();
+
+    d->setState(FFPlayer::PausedState);
 }
 
 void FFPlayer::close() {
     Q_D(FFPlayer);
-    d->close();
+
+    if (d->future_watcher.isRunning()) {
+        d->setIsInterruptedByUser(true);
+        d->future_watcher.cancel();
+        d->future_watcher.waitForFinished();
+    }
 }
 
-double FFPlayer::getFrameRate() const {
-    return 0.0;
-}
-
-double FFPlayer::getDuration() const {
+FFPlayer::State FFPlayer::getState() const {
     Q_D(const FFPlayer);
-    return d->getDuration();
+    return d->state();
 }
 
-int FFPlayer::getFrameWidth() const {
+bool FFPlayer::isNeedAutoReconnect() const {
     Q_D(const FFPlayer);
-    return !d->getFrameWidth();
+    return d->isUserNeedAutoReconnect();
 }
 
-int FFPlayer::getFrameHeight() const {
-    Q_D(const FFPlayer);
-    return !d->getFrameHeight();
-}
-
-FFPlayer::FFPlayerState FFPlayer::getState() const {
-    Q_D(const FFPlayer);
-    return d->getState();
+void FFPlayer::setIsNeedAutoReconnect(bool isNeedAutoReconnect) {
+    Q_D(FFPlayer);
+    d->setIsUserNeedAutoReconnect(isNeedAutoReconnect);
 }

@@ -44,6 +44,7 @@ public:
     virtual ~FFFrame();
 
     double position;
+    double duration;
     double frameDelayMsec;
 
     virtual FFFrameType getFrameType();

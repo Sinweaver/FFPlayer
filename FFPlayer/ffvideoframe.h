@@ -39,12 +39,11 @@ public:
     explicit FFVideoFrame();
     virtual ~FFVideoFrame();
 
-    QImage image;
+    QSharedPointer<QImage> image;
 
-    int linesize;
     int width;
     int height;
-    float sampleRate;
+    float fps;
 
     // FFFrame interface
 public:

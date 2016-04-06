@@ -30,11 +30,9 @@
 
 #include <QObject>
 #include <QScopedPointer>
-#include <QSharedPointer>
 
 #include "ffheaders.h"
-#include "ffvideoframe.h"
-#include "ffaudioframe.h"
+#include "ffframe.h"
 
 class FFDecoderPrivate;
 class FFDecoder : public QObject
@@ -46,17 +44,16 @@ public:
 
     QList<FFFramePtr> decodeFrames(AVPacket *packet);
 
-    int getFrameWidth() const;
-    int getFrameHeight() const;
-
 signals:
 
 public slots:
 
-private:
+protected:
     QScopedPointer<FFDecoderPrivate> d_ptr;
-};
 
-typedef QSharedPointer<FFDecoder> FFDecoderPtr;
+private:
+    Q_DECLARE_PRIVATE(FFDecoder)
+    Q_DISABLE_COPY(FFDecoder)
+};
 
 #endif // FFVIDEODECODER_H

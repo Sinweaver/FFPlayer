@@ -25,12 +25,11 @@
 //  SOFTWARE.
 //
 
-#ifndef FFDEMUXER_H
-#define FFDEMUXER_H
+#ifndef FFPLAYER_H
+#define FFPLAYER_H
 
 #include <QUrl>
 #include <QScopedPointer>
-#include <QSharedPointer>
 
 #include "ffvideoframe.h"
 #include "ffaudioframe.h"
@@ -40,11 +39,11 @@ class FFPlayer : public QObject {
     Q_OBJECT
 public:
     /** Playback state */
-    typedef enum {
-        FFPlayerStateClosed = 0,
-        FFPlayerStatePlaying,
-        FFPlayerStatePaused,
-    } FFPlayerState;
+    enum State {
+        StoppedState,
+        PlayingState,
+        PausedState
+    };
 
     explicit FFPlayer(QObject *parent = 0);
     virtual ~FFPlayer();
@@ -54,17 +53,14 @@ public:
     void play();
     void pause();
 
-    double getFrameRate() const;
-    double getDuration() const;
+    bool isNeedAutoReconnect() const;
+    void setIsNeedAutoReconnect(bool isNeedAutoReconnect);
 
-    int getFrameWidth() const;
-    int getFrameHeight() const;
-
-    FFPlayerState getState() const;
+    State getState() const;
 
 signals:
     void updateVideoFrame(FFVideoFramePtr frame);
-    void stateChanged(FFPlayerState status);
+    void stateChanged(State status);
 
     void contentDidOpened();
     void contentDidClosed();
@@ -79,7 +75,7 @@ private:
     Q_DISABLE_COPY(FFPlayer)
 };
 
-typedef QSharedPointer<FFPlayer> FFPlayerPtr;
 Q_DECLARE_METATYPE(FFVideoFramePtr)
+typedef QSharedPointer<FFPlayer> FFPlayerPtr;
 
-#endif // FFDEMUXER_H
+#endif // FFPLAYER_H

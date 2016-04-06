@@ -29,6 +29,7 @@
 
 FFFrame::FFFrame():
     position(0.0),
+    duration(0.0),
     frameDelayMsec(0.0) {
 
 }
